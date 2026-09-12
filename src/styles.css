@@ -122,6 +122,30 @@ audio {
   border-radius: 999px;
 }
 
+.sequential-badge {
+  font-size: 12px;
+  color: #ffd479;
+  border: 1px solid rgba(255, 193, 105, 0.5);
+  background: rgba(255, 193, 105, 0.1);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.clip-item.sequential-on {
+  box-shadow: 0 0 0 1px rgba(255, 193, 105, 0.8) inset;
+}
+
+.clip-list-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.sequential-note {
+  margin: 0 0 12px;
+}
+
 button {
   background: var(--panel-2);
   color: var(--text);

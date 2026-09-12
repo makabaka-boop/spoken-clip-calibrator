@@ -10,6 +10,16 @@ import {
   type Clip,
 } from './lib/clips';
 import { parseImportPayload } from './lib/importClips';
+import {
+  IDLE_SEQUENTIAL_SESSION,
+  beginNextClip,
+  buildSequentialQueue,
+  clipReachedEnd,
+  currentSequentialId,
+  startSequentialSession,
+  stopSequentialSession,
+  type SequentialSession,
+} from './lib/sequentialAudition';
 import { formatTimecode, toMillis, validateBoundaries, validateLabel } from './lib/time';
 
 interface LoadedAudio {
@@ -33,6 +43,11 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // 当前正在试听的片段 id；null 表示普通播放/未试听。
   const [auditionId, setAuditionId] = useState<string | null>(null);
+  // 顺序审听会话：只有空闲 / 播放当前片段 / 切换下一片段三种状态；
+  // 空闲态保留队列与 index，游标因此停在当前（或末条）片段起点。
+  const [sequential, setSequential] = useState<SequentialSession>(IDLE_SEQUENTIAL_SESSION);
+  // 顺序审听失败时在清单旁说明的失败片段；已保存记录与顺序不变，可从当前选择重试。
+  const [sequentialNote, setSequentialNote] = useState<string | null>(null);
 
   // 单一校准编辑态：仅记录正在校准的片段 id；表单值单独保存，预填原记录。
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -56,6 +71,9 @@ export default function App() {
   // clips 同步给 rAF 闭包读取，避免每帧重建监听。
   const clipsRef = useRef<Clip[]>([]);
   const loopResumeTimerRef = useRef<number | null>(null);
+  // 顺序审听会话同步给 rAF / 定时器闭包读取；切换停留由独立定时器负责。
+  const sequentialRef = useRef<SequentialSession>(IDLE_SEQUENTIAL_SESSION);
+  const sequentialSwitchTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     auditionRef.current = auditionId;
@@ -66,12 +84,69 @@ export default function App() {
   }, [clips]);
 
   useEffect(() => {
+    sequentialRef.current = sequential;
+  }, [sequential]);
+
+  useEffect(() => {
     loadedAudioRef.current = audio;
   }, [audio]);
 
   /* ------------------------------ 播放位置观测 ------------------------------ */
   // 以 requestAnimationFrame 在播放中持续读取原始 currentTime，保证在
   // 首次达到/越过终点的当帧即可暂停；不向整秒做任何吸附。
+
+  const clearSequentialSwitchTimer = useCallback(() => {
+    if (sequentialSwitchTimerRef.current !== null) {
+      window.clearTimeout(sequentialSwitchTimerRef.current);
+      sequentialSwitchTimerRef.current = null;
+    }
+  }, []);
+
+  // 当前片段首次达到终点后的推进：暂停并复位到当前片段精确起点，再做会话
+  // 推演——末条收束（空闲，停在末条起点），其余进入切换停留。
+  const settleSequentialClipEnd = useCallback(() => {
+    const session = sequentialRef.current;
+    if (session.phase !== 'playing') return;
+    const currentId = currentSequentialId(session);
+    const current = clipsRef.current.find((c) => c.id === currentId);
+    const el = audioRef.current;
+    if (!current) return;
+    if (el && !el.paused) el.pause();
+    if (el) {
+      internalSeekRef.current = true;
+      el.currentTime = current.startMs / 1000;
+    }
+    setCurrentMs(current.startMs);
+    const next = clipReachedEnd(session);
+    sequentialRef.current = next;
+    setSequential(next);
+    if (next.phase !== 'switching') return;
+    // 切换下一片段：选中并从其精确起点播放；媒体拒绝播放则结束本次顺序审听，
+    // 已保存记录及其顺序不变，用户仍可从当前选择重试。
+    clearSequentialSwitchTimer();
+    sequentialSwitchTimerRef.current = window.setTimeout(() => {
+      sequentialSwitchTimerRef.current = null;
+      const switched = beginNextClip(sequentialRef.current);
+      if (switched.phase !== 'playing') return;
+      const target = clipsRef.current.find((c) => c.id === currentSequentialId(switched));
+      const el = audioRef.current;
+      if (!target || !el) return;
+      setSelectedId(target.id);
+      sequentialRef.current = switched;
+      setSequential(switched);
+      internalSeekRef.current = true;
+      el.currentTime = target.startMs / 1000;
+      setCurrentMs(target.startMs);
+      void el.play().catch(() => {
+        const failed = stopSequentialSession(sequentialRef.current);
+        sequentialRef.current = failed;
+        setSequential(failed);
+        setSequentialNote(
+          `顺序审听在片段「${target.label}」处被浏览器拒绝播放，已终止；记录与顺序未改变，可从该片段重新开始。`,
+        );
+      });
+    }, 450);
+  }, [clearSequentialSwitchTimer]);
 
   useEffect(() => {
     if (!audio) return;
@@ -108,6 +183,18 @@ export default function App() {
           }, 450);
         }
       }
+
+      // 顺序审听：与单条循环复用同一毫秒换算与终点判定，但不循环——
+      // 暂停复位后推进到下一条，末条收束退出。
+      const session = sequentialRef.current;
+      if (session.phase === 'playing' && !el.paused) {
+        const current = clipsRef.current.find(
+          (c) => c.id === currentSequentialId(session),
+        );
+        if (current && nowMs >= current.endMs) {
+          settleSequentialClipEnd();
+        }
+      }
     };
     frame = requestAnimationFrame(tick);
     return () => {
@@ -116,8 +203,9 @@ export default function App() {
         window.clearTimeout(loopResumeTimerRef.current);
         loopResumeTimerRef.current = null;
       }
+      clearSequentialSwitchTimer();
     };
-  }, [audio]);
+  }, [audio, clearSequentialSwitchTimer, settleSequentialClipEnd]);
 
   /* ------------------------------- 加载本地音频 ------------------------------- */
 
@@ -140,11 +228,15 @@ export default function App() {
       window.clearTimeout(loopResumeTimerRef.current);
       loopResumeTimerRef.current = null;
     }
+    clearSequentialSwitchTimer();
     auditionRef.current = null;
     createdCountRef.current = 0;
     setClips([]);
     setSelectedId(null);
     setAuditionId(null);
+    sequentialRef.current = IDLE_SEQUENTIAL_SESSION;
+    setSequential(IDLE_SEQUENTIAL_SESSION);
+    setSequentialNote(null);
     setEditingId(null);
     setEditError(null);
     setPendingStartMs(null);
@@ -153,7 +245,7 @@ export default function App() {
     setCurrentMs(0);
     setIsPlaying(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
-  }, []);
+  }, [clearSequentialSwitchTimer]);
 
   const onFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -178,6 +270,7 @@ export default function App() {
         window.clearTimeout(loopResumeTimerRef.current);
         loopResumeTimerRef.current = null;
       }
+      clearSequentialSwitchTimer();
       if (el && !el.paused) el.pause();
       try {
         const text = await file.text();
@@ -201,6 +294,11 @@ export default function App() {
         if (el && !el.paused) el.pause();
         auditionRef.current = null;
         setAuditionId(null);
+        // 清单被整体替换：进行中的顺序审听随之终止，旧队列不再有效。
+        clearSequentialSwitchTimer();
+        sequentialRef.current = IDLE_SEQUENTIAL_SESSION;
+        setSequential(IDLE_SEQUENTIAL_SESSION);
+        setSequentialNote(null);
         // 后续创建序号接在已有最大值之后。
         createdCountRef.current = result.nextCreatedAt;
         setClips(result.clips);
@@ -215,7 +313,7 @@ export default function App() {
         if (importInputRef.current) importInputRef.current.value = '';
       }
     },
-    [audio],
+    [audio, clearSequentialSwitchTimer],
   );
 
   const onImportInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -262,6 +360,9 @@ export default function App() {
     setIsPlaying(false);
     setAuditionId(null);
     auditionRef.current = null;
+    // 顺序审听中片段终点恰为媒体末端时不会再有 rAF 推进帧，执行同样的收束
+    // （暂停复位 + 推进/退出；此时媒体已在末端，回放定位由收束逻辑完成）。
+    settleSequentialClipEnd();
   };
 
   /* ---------------------------------- 打点 ---------------------------------- */
@@ -315,47 +416,131 @@ export default function App() {
 
   /* ------------------------------- 清单：试听/删除 ------------------------------ */
 
-  // 从给定片段的精确起点开始循环试听。校准保存后以新范围调用同一逻辑。
-  const auditionClip = useCallback((clip: Clip) => {
+  // 结束顺序审听但不复位游标（循环试听、删除等另有定位/语义的场景使用）。
+  const endSequentialWithoutReset = useCallback(() => {
+    if (sequentialRef.current.phase === 'idle') return;
+    clearSequentialSwitchTimer();
+    const idle = stopSequentialSession(sequentialRef.current);
+    sequentialRef.current = idle;
+    setSequential(idle);
+  }, [clearSequentialSwitchTimer]);
+
+  // 顺序审听：从选中记录开始，按导出排序连续审听当前项与后续项。
+  const startSequentialAudition = () => {
     const el = audioRef.current;
-    if (!el) return;
+    if (!el || !selectedClip || sequentialRef.current.phase !== 'idle') return;
     setError(null);
+    setSequentialNote(null);
+    const queue = buildSequentialQueue(clipsRef.current, selectedClip.id);
+    const session = startSequentialSession(queue ?? []);
+    if (!session) return;
     if (loopResumeTimerRef.current !== null) {
       window.clearTimeout(loopResumeTimerRef.current);
       loopResumeTimerRef.current = null;
     }
-    // 试听必须从记录起点开始。
-    internalSeekRef.current = true;
-    el.currentTime = clip.startMs / 1000;
-    setCurrentMs(clip.startMs);
-    auditionRef.current = clip.id;
-    setAuditionId(clip.id);
-    void el.play().catch(() => {
-      setError('浏览器拒绝了播放，请再次点击试听。');
-    });
-  }, []);
-
-  const stopClipAudition = useCallback((clipId: string) => {
-    if (auditionRef.current !== clipId) return;
-    const el = audioRef.current;
-    const clip = clipsRef.current.find((c) => c.id === clipId);
     auditionRef.current = null;
     setAuditionId(null);
-    if (loopResumeTimerRef.current !== null) {
-      window.clearTimeout(loopResumeTimerRef.current);
-      loopResumeTimerRef.current = null;
-    }
+    setSelectedId(selectedClip.id);
+    sequentialRef.current = session;
+    setSequential(session);
+    // 从选中片段的精确起点开始播放。
+    internalSeekRef.current = true;
+    el.currentTime = selectedClip.startMs / 1000;
+    setCurrentMs(selectedClip.startMs);
+    void el.play().catch(() => {
+      // 开始播放即被媒体拒绝：结束本次顺序审听并在清单旁说明，
+      // 已保存记录及其顺序不变，用户仍可从当前选择重试。
+      const failed = stopSequentialSession(sequentialRef.current);
+      sequentialRef.current = failed;
+      setSequential(failed);
+      setSequentialNote(
+        `顺序审听在片段「${selectedClip.label}」处被浏览器拒绝播放，已终止；记录与顺序未改变，可从该片段重新开始。`,
+      );
+    });
+  };
+
+  // 顺序审听中途终止：随时可点当前片段的既有“停止试听”，游标回到当前片段起点。
+  const stopSequentialAudition = useCallback(() => {
+    const session = sequentialRef.current;
+    if (session.phase === 'idle') return;
+    const clip = clipsRef.current.find((c) => c.id === currentSequentialId(session));
+    clearSequentialSwitchTimer();
+    const el = audioRef.current;
     if (el && !el.paused) el.pause();
-    // 停在精确起点，便于验收者核对游标。
     if (el && clip) {
       internalSeekRef.current = true;
       el.currentTime = clip.startMs / 1000;
       setCurrentMs(clip.startMs);
     }
-  }, []);
+    const idle = stopSequentialSession(session);
+    sequentialRef.current = idle;
+    setSequential(idle);
+  }, [clearSequentialSwitchTimer]);
+
+  // 从给定片段的精确起点开始循环试听。校准保存后以新范围调用同一逻辑。
+  const auditionClip = useCallback(
+    (clip: Clip) => {
+      const el = audioRef.current;
+      if (!el) return;
+      setError(null);
+      // 单条循环试听与顺序审听互斥：启动循环即终止可能正在进行的顺序审听，
+      // 单条循环试听自身的行为（复位、循环、停止）保持原样。
+      endSequentialWithoutReset();
+      if (loopResumeTimerRef.current !== null) {
+        window.clearTimeout(loopResumeTimerRef.current);
+        loopResumeTimerRef.current = null;
+      }
+      // 试听必须从记录起点开始。
+      internalSeekRef.current = true;
+      el.currentTime = clip.startMs / 1000;
+      setCurrentMs(clip.startMs);
+      auditionRef.current = clip.id;
+      setAuditionId(clip.id);
+      void el.play().catch(() => {
+        setError('浏览器拒绝了播放，请再次点击试听。');
+      });
+    },
+    [endSequentialWithoutReset],
+  );
+
+  // 既有“停止试听”：结束单条循环试听或顺序审听；顺序审听时游标回到当前片段起点。
+  const stopClipAudition = useCallback(
+    (clipId: string) => {
+      const isSequentialTarget =
+        sequentialRef.current.phase !== 'idle' &&
+        currentSequentialId(sequentialRef.current) === clipId;
+      if (auditionRef.current === clipId) {
+        const el = audioRef.current;
+        const clip = clipsRef.current.find((c) => c.id === clipId);
+        auditionRef.current = null;
+        setAuditionId(null);
+        if (loopResumeTimerRef.current !== null) {
+          window.clearTimeout(loopResumeTimerRef.current);
+          loopResumeTimerRef.current = null;
+        }
+        if (el && !el.paused) el.pause();
+        // 停在精确起点，便于验收者核对游标。
+        if (el && clip) {
+          internalSeekRef.current = true;
+          el.currentTime = clip.startMs / 1000;
+          setCurrentMs(clip.startMs);
+        }
+      } else if (isSequentialTarget) {
+        stopSequentialAudition();
+      }
+    },
+    [stopSequentialAudition],
+  );
 
   const deleteClip = (id: string) => {
     if (auditionRef.current === id) stopClipAudition(id);
+    // 删除顺序审听队列中的记录：终止会话，避免悬挂到已不存在的片段。
+    if (
+      sequentialRef.current.phase !== 'idle' &&
+      sequentialRef.current.queue.includes(id)
+    ) {
+      endSequentialWithoutReset();
+    }
     setClips((prev) => prev.filter((c) => c.id !== id));
     setSelectedId((prev) => (prev === id ? null : prev));
     // 正在校准的记录被删除：连同退出编辑态，避免悬挂的表单。
@@ -388,6 +573,8 @@ export default function App() {
 
   // 编辑态中改选其他记录：带着新选中的记录继续校准（仍为单一编辑态）。
   const selectClip = (id: string) => {
+    // 顺序审听进行中选择随播放自动推进，忽略手动改选以免游标与播放脱节。
+    if (sequentialRef.current.phase !== 'idle') return;
     setSelectedId(id);
     if (editingId !== null && editingId !== id) {
       const next = clipsRef.current.find((c) => c.id === id);
@@ -465,6 +652,13 @@ export default function App() {
 
   const selectedClip = clips.find((c) => c.id === selectedId) ?? null;
   const auditioningClip = clips.find((c) => c.id === auditionId) ?? null;
+  // 顺序审听派生视图：进行中（播放/切换）、当前片段与入口可用性。
+  const sequentialActive = sequential.phase !== 'idle';
+  const sequentialCurrentId = currentSequentialId(sequential);
+  const sequentialCurrentClip =
+    clips.find((c) => c.id === sequentialCurrentId) ?? null;
+  const sequentialEntryAvailable =
+    !!audio && clips.length > 0 && !!selectedClip && !sequentialActive;
   const progressValue = audio ? Math.min(currentMs, audio.durationMs) : 0;
 
   return (
@@ -565,6 +759,12 @@ export default function App() {
               ms）
             </span>
           )}
+          {sequentialActive && sequentialCurrentClip && (
+            <span className="sequential-badge" data-testid="sequential-badge">
+              顺序审听（{sequential.phase === 'switching' ? '切换下一片段' : '播放当前片段'}）：
+              {sequentialCurrentClip.label}（{sequential.index + 1}/{sequential.queue.length}）
+            </span>
+          )}
         </div>
       </section>
 
@@ -606,15 +806,35 @@ export default function App() {
       <section className="panel" aria-label="片段清单">
         <div className="clip-list-header">
           <h2>片段清单（{clips.length}）</h2>
-          <button
-            type="button"
-            data-testid="edit-selected-clip"
-            onClick={() => selectedClip && beginEditClip(selectedClip)}
-            disabled={!selectedClip || editingId !== null}
-          >
-            校准所选片段
-          </button>
+          <div className="clip-list-actions">
+            <button
+              type="button"
+              data-testid="sequential-audition"
+              onClick={startSequentialAudition}
+              disabled={!sequentialEntryAvailable}
+              title={
+                sequentialActive
+                  ? '顺序审听进行中，可点当前片段的“停止试听”终止'
+                  : '从选中记录开始，按导出排序连续审听当前项与后续项'
+              }
+            >
+              顺序审听
+            </button>
+            <button
+              type="button"
+              data-testid="edit-selected-clip"
+              onClick={() => selectedClip && beginEditClip(selectedClip)}
+              disabled={!selectedClip || editingId !== null || sequentialActive}
+            >
+              校准所选片段
+            </button>
+          </div>
         </div>
+        {sequentialNote && (
+          <div className="error sequential-note" role="alert" data-testid="sequential-note">
+            {sequentialNote}
+          </div>
+        )}
         {clips.length === 0 ? (
           <p className="muted" data-testid="empty-list">
             还没有片段。播放录音，分别捕获起点、终点并填写标签后加入。
@@ -626,7 +846,7 @@ export default function App() {
                 key={clip.id}
                 className={`clip-item ${selectedId === clip.id ? 'selected' : ''} ${
                   auditionId === clip.id ? 'auditioning' : ''
-                }`}
+                } ${sequentialActive && sequentialCurrentId === clip.id ? 'sequential-on' : ''}`}
                 data-testid="clip-item"
                 data-clip-id={clip.id}
               >
@@ -636,6 +856,7 @@ export default function App() {
                     name="selected-clip"
                     data-testid="clip-select"
                     checked={selectedId === clip.id}
+                    disabled={sequentialActive}
                     onChange={() => selectClip(clip.id)}
                   />
                 </label>
@@ -648,14 +869,23 @@ export default function App() {
                     {formatTimecode(clip.startMs)} – {formatTimecode(clip.endMs)}）
                   </span>
                 </div>
-                <button type="button" data-testid="audition-clip" onClick={() => auditionClip(clip)}>
+                <button
+                  type="button"
+                  data-testid="audition-clip"
+                  onClick={() => auditionClip(clip)}
+                  disabled={sequentialActive}
+                >
                   循环试听
                 </button>
                 <button
                   type="button"
                   data-testid="stop-audition"
                   onClick={() => stopClipAudition(clip.id)}
-                  disabled={auditionId !== clip.id}
+                  disabled={
+                    auditionId === clip.id
+                      ? false
+                      : !(sequentialActive && sequentialCurrentId === clip.id)
+                  }
                 >
                   停止试听
                 </button>
@@ -664,6 +894,7 @@ export default function App() {
                   className="danger"
                   data-testid="delete-clip"
                   onClick={() => deleteClip(clip.id)}
+                  disabled={sequentialActive}
                 >
                   删除
                 </button>
@@ -778,6 +1009,8 @@ export default function App() {
 
       <footer className="footer muted">
         试听规则：从记录起点开始播放，首次观测到当前毫秒 ≥ 终点即暂停并回到起点，随后循环；全程不吸附整秒。
+        「顺序审听」从选中记录开始，按起点、终点、创建序号排序连续审听当前项与后续项：每条到终点暂停复位后
+        自动选中并播放下一条，末条结束后停在其起点并退出；随时点当前片段的「停止试听」可终止并回到当前片段起点。
       </footer>
     </div>
   );
