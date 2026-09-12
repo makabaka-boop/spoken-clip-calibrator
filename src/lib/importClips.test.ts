@@ -221,3 +221,27 @@ describe('parseImportPayload 逐条记录校验（复用毫秒边界规则）', 
     expect('clips' in result).toBe(false);
   });
 });
+
+describe('校准后的记录导出后再次导入：格式无需升级', () => {
+  it('只改起点/终点/标签、保留创建序号的记录可原样恢复并继续排序', () => {
+    // 模拟“校准”： createdAt 0 的片段被改到更早的范围与新标签，
+    // 载荷形状与未编辑记录完全一致——没有新增/改变任何字段。
+    const payload = makePayload({
+      clips: [
+        { index: 0, startMs: 50, endMs: 300, durationMs: 250, label: '校准后的片段', createdAt: 1 },
+        { index: 1, startMs: 2000, endMs: 2500, durationMs: 500, label: '后创建的片段', createdAt: 0 },
+      ],
+    });
+    const result = expectOk(importPayload(payload));
+    expect(result.clips).toHaveLength(2);
+    // 按创建序号还原清单顺序，校准没有重建记录身份（序号仍是 1）
+    expect(result.clips.map((c) => c.createdAt)).toEqual([0, 1]);
+    expect(result.clips[1]).toMatchObject({
+      startMs: 50,
+      endMs: 300,
+      label: '校准后的片段',
+      createdAt: 1,
+    });
+    expect(result.nextCreatedAt).toBe(2);
+  });
+});

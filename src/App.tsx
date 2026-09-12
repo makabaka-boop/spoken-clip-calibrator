@@ -5,6 +5,8 @@ import {
   createClipId,
   downloadBlob,
   exportClipsAsJson,
+  reviseClipInList,
+  reviseClipValues,
   type Clip,
 } from './lib/clips';
 import { parseImportPayload } from './lib/importClips';
@@ -31,6 +33,14 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // 当前正在试听的片段 id；null 表示普通播放/未试听。
   const [auditionId, setAuditionId] = useState<string | null>(null);
+
+  // 单一校准编辑态：仅记录正在校准的片段 id；表单值单独保存，预填原记录。
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editStartText, setEditStartText] = useState('');
+  const [editEndText, setEditEndText] = useState('');
+  const [editLabel, setEditLabel] = useState('');
+  // 校验失败原因只在编辑区内指出，与打点表单的全局 error 互不干扰。
+  const [editError, setEditError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
@@ -135,6 +145,8 @@ export default function App() {
     setClips([]);
     setSelectedId(null);
     setAuditionId(null);
+    setEditingId(null);
+    setEditError(null);
     setPendingStartMs(null);
     setPendingEndMs(null);
     setLabel('');
@@ -193,6 +205,9 @@ export default function App() {
         createdCountRef.current = result.nextCreatedAt;
         setClips(result.clips);
         setSelectedId(result.clips[0]?.id ?? null);
+        // 清单被整体替换：退出可能正开着的校准编辑态。
+        setEditingId(null);
+        setEditError(null);
       } finally {
         importingRef.current = false;
         setIsImporting(false);
@@ -300,6 +315,7 @@ export default function App() {
 
   /* ------------------------------- 清单：试听/删除 ------------------------------ */
 
+  // 从给定片段的精确起点开始循环试听。校准保存后以新范围调用同一逻辑。
   const auditionClip = useCallback((clip: Clip) => {
     const el = audioRef.current;
     if (!el) return;
@@ -342,6 +358,94 @@ export default function App() {
     if (auditionRef.current === id) stopClipAudition(id);
     setClips((prev) => prev.filter((c) => c.id !== id));
     setSelectedId((prev) => (prev === id ? null : prev));
+    // 正在校准的记录被删除：连同退出编辑态，避免悬挂的表单。
+    if (editingId === id) {
+      setEditingId(null);
+      setEditError(null);
+    }
+  };
+
+  /* ----------------------------- 校准（编辑）所选片段 ---------------------------- */
+  // 复听后微调：在单一编辑态中预填原标签与整数毫秒边界；确认保存只替换原记录
+  // 的起点、终点与标签，id 与创建序号保留，随后仍选中该记录并按新范围循环试听。
+
+  const editingClip = clips.find((c) => c.id === editingId) ?? null;
+
+  // 进入单一编辑态：表单预填原标签与整数毫秒边界。
+  const beginEditClip = (clip: Clip) => {
+    setError(null);
+    setEditingId(clip.id);
+    setEditStartText(String(clip.startMs));
+    setEditEndText(String(clip.endMs));
+    setEditLabel(clip.label);
+    setEditError(null);
+  };
+
+  const cancelEditClip = () => {
+    setEditingId(null);
+    setEditError(null);
+  };
+
+  // 编辑态中改选其他记录：带着新选中的记录继续校准（仍为单一编辑态）。
+  const selectClip = (id: string) => {
+    setSelectedId(id);
+    if (editingId !== null && editingId !== id) {
+      const next = clipsRef.current.find((c) => c.id === id);
+      if (next) {
+        setEditingId(next.id);
+        setEditStartText(String(next.startMs));
+        setEditEndText(String(next.endMs));
+        setEditLabel(next.label);
+        setEditError(null);
+      }
+    }
+  };
+
+  // 整数毫秒解析：表单只接受可选符号开头的整数（与时间码规则一致）。
+  const parseEditMs = (text: string, fieldName: string): number | { error: string } => {
+    const trimmed = text.trim();
+    if (!/^[+-]?\d+$/.test(trimmed)) {
+      return { error: `${fieldName}必须填写整数毫秒（当前为「${text}」）。` };
+    }
+    const value = Number(trimmed);
+    if (!Number.isSafeInteger(value)) {
+      return { error: `${fieldName}超出可可靠表示的整数范围。` };
+    }
+    return value;
+  };
+
+  const saveClipEdit = () => {
+    if (!audio || !editingClip) return;
+    const target = editingClip;
+    const startParsed = parseEditMs(editStartText, '起点');
+    if (typeof startParsed !== 'number') {
+      setEditError(startParsed.error);
+      return;
+    }
+    const endParsed = parseEditMs(editEndText, '终点');
+    if (typeof endParsed !== 'number') {
+      setEditError(endParsed.error);
+      return;
+    }
+    // 复用与加入片段 / 导入完全相同的标签与毫秒边界规则。
+    // 失败只在编辑区指出原因：清单、选择、播放位置与原试听范围一律不变。
+    const result = reviseClipValues(
+      { startMs: startParsed, endMs: endParsed, label: editLabel },
+      audio.durationMs,
+    );
+    if (!result.ok) {
+      setEditError(result.error);
+      return;
+    }
+    const revision = { startMs: result.startMs, endMs: result.endMs, label: result.label };
+    // 只更新原记录的三字段：reviseClipInList 按 id 就地替换，身份不重建。
+    setClips((prev) => reviseClipInList(prev, target.id, revision));
+    const updatedClip: Clip = { ...target, ...revision };
+    // 保存后仍选中该记录，退出编辑态，立即按新范围从新起点循环试听。
+    setSelectedId(updatedClip.id);
+    setEditingId(null);
+    setEditError(null);
+    auditionClip(updatedClip);
   };
 
   /* ---------------------------------- 导出 ---------------------------------- */
@@ -500,7 +604,17 @@ export default function App() {
       </section>
 
       <section className="panel" aria-label="片段清单">
-        <h2>片段清单（{clips.length}）</h2>
+        <div className="clip-list-header">
+          <h2>片段清单（{clips.length}）</h2>
+          <button
+            type="button"
+            data-testid="edit-selected-clip"
+            onClick={() => selectedClip && beginEditClip(selectedClip)}
+            disabled={!selectedClip || editingId !== null}
+          >
+            校准所选片段
+          </button>
+        </div>
         {clips.length === 0 ? (
           <p className="muted" data-testid="empty-list">
             还没有片段。播放录音，分别捕获起点、终点并填写标签后加入。
@@ -522,7 +636,7 @@ export default function App() {
                     name="selected-clip"
                     data-testid="clip-select"
                     checked={selectedId === clip.id}
-                    onChange={() => setSelectedId(clip.id)}
+                    onChange={() => selectClip(clip.id)}
                   />
                 </label>
                 <div className="clip-info">
@@ -556,6 +670,86 @@ export default function App() {
               </li>
             ))}
           </ul>
+        )}
+
+        {editingClip && (
+          <form
+            className="clip-editor"
+            data-testid="clip-editor"
+            aria-label="校准所选片段"
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveClipEdit();
+            }}
+          >
+            <h3 data-testid="clip-editor-title">
+              校准片段（创建序号 {editingClip.createdAt}）
+            </h3>
+            <p className="muted clip-editor-hint">
+              表单已预填原标签与整数毫秒边界；保存只更新该记录的起点、终点与标签，页面标识与创建序号不变。
+            </p>
+            <div className="editor-row">
+              <label htmlFor="edit-start-input">起点（整数毫秒）</label>
+              <input
+                id="edit-start-input"
+                data-testid="edit-start-input"
+                type="number"
+                inputMode="numeric"
+                step={1}
+                value={editStartText}
+                onChange={(e) => setEditStartText(e.target.value)}
+              />
+              <span className="muted" data-testid="edit-start-timecode">
+                {/^[+-]?\d+$/.test(editStartText.trim())
+                  ? formatTimecode(Number(editStartText.trim()))
+                  : '—'}
+              </span>
+            </div>
+            <div className="editor-row">
+              <label htmlFor="edit-end-input">终点（整数毫秒）</label>
+              <input
+                id="edit-end-input"
+                data-testid="edit-end-input"
+                type="number"
+                inputMode="numeric"
+                step={1}
+                value={editEndText}
+                onChange={(e) => setEditEndText(e.target.value)}
+              />
+              <span className="muted" data-testid="edit-end-timecode">
+                {/^[+-]?\d+$/.test(editEndText.trim())
+                  ? formatTimecode(Number(editEndText.trim()))
+                  : '—'}
+              </span>
+            </div>
+            <div className="editor-row">
+              <label htmlFor="edit-label-input">标签（必填，非空）</label>
+              <input
+                id="edit-label-input"
+                data-testid="edit-label-input"
+                type="text"
+                value={editLabel}
+                onChange={(e) => setEditLabel(e.target.value)}
+              />
+            </div>
+            {editError && (
+              <div className="error edit-error" role="alert" data-testid="edit-error">
+                {editError}
+              </div>
+            )}
+            <div className="editor-actions">
+              <button type="submit" data-testid="save-clip-edit">
+                确认保存
+              </button>
+              <button
+                type="button"
+                data-testid="cancel-clip-edit"
+                onClick={cancelEditClip}
+              >
+                取消
+              </button>
+            </div>
+          </form>
         )}
       </section>
 
