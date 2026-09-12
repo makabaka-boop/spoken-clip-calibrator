@@ -264,6 +264,89 @@ test('损坏或不匹配的导入文件就地报错，清单、选择与播放�
   ).toHaveText('另一条');
 });
 
+test('播放中导入损坏文件：报错并保留导入前的播放位置，不再前移', async ({ page }) => {
+  await page.goto('/');
+  await loadFile(page, 'sample.wav');
+  await page.locator('[data-testid="play-button"]').click();
+  await expect(page.locator('[data-testid="play-button"]')).toHaveText('暂停');
+  // 等播放位置明确离开 0
+  await expect
+    .poll(() => currentMs(page), { timeout: 3000, intervals: [16] })
+    .toBeGreaterThan(200);
+  const before = await currentMs(page);
+
+  await importJson(page, 'broken.clips.json', '这不是 JSON {{{');
+  await expect(page.locator('[data-testid="error"]')).toContainText('无法解析');
+
+  // 报错后位置冻结在导入前附近：连续读数一致，且没有明显越过导入前位置
+  const pos1 = await currentMs(page);
+  await page.waitForTimeout(500);
+  const pos2 = await currentMs(page);
+  expect(pos2).toBe(pos1);
+  expect(pos1 - before).toBeLessThan(250);
+  await expect(page.locator('[data-testid="play-button"]')).toHaveText('播放');
+});
+
+test('循环试听中导入合法会话：被替换片段的试听停止，音频不再继续播放', async ({ page }) => {
+  await page.goto('/');
+  await loadFile(page, 'sample.wav');
+  // 片段足够长，排除“自然播完”对暂停断言的干扰
+  await addClipViaUi(page, 0.2, 2.5, '旧片段');
+  const audio = page.locator('[data-testid="audio-element"]');
+  await page
+    .locator('[data-testid="clip-item"]')
+    .first()
+    .locator('[data-testid="audition-clip"]')
+    .click();
+  await expect(page.locator('[data-testid="audition-badge"]')).toBeVisible();
+
+  const payload = {
+    audioFileName: 'sample.wav',
+    durationMs: 3250,
+    clips: [
+      { index: 0, startMs: 1000, endMs: 1500, durationMs: 500, label: '导入的片段', createdAt: 0 },
+    ],
+  };
+  await importJson(page, 'session.clips.json', JSON.stringify(payload));
+
+  // 旧试听标识消失，清单被整体替换
+  await expect(page.locator('[data-testid="audition-badge"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="clip-item"]')).toHaveCount(1);
+  await expect(page.locator('[data-testid="clip-label"]')).toHaveText('导入的片段');
+  // 音频已暂停；越过循环复位等待期（450ms）后仍保持暂停，没有继续发声
+  await expect
+    .poll(async () => audio.evaluate((el: HTMLAudioElement) => el.paused), {
+      timeout: 2000,
+      intervals: [16],
+    })
+    .toBe(true);
+  await page.waitForTimeout(700);
+  expect(await audio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(true);
+});
+
+test('导入超大创建序号的会话被整体拒绝，清单不变', async ({ page }) => {
+  await page.goto('/');
+  await loadFile(page, 'sample.wav');
+  const payload = {
+    audioFileName: 'sample.wav',
+    durationMs: 3250,
+    clips: [
+      {
+        index: 0,
+        startMs: 100,
+        endMs: 500,
+        durationMs: 400,
+        label: '超大序号',
+        createdAt: Number.MAX_SAFE_INTEGER,
+      },
+    ],
+  };
+  await importJson(page, 'huge-created-at.clips.json', JSON.stringify(payload));
+  await expect(page.locator('[data-testid="error"]')).toContainText('续接');
+  await expect(page.locator('[data-testid="clip-item"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="empty-list"]')).toBeVisible();
+});
+
 test('读取与校验期间显示处理中并禁用导入输入，结束后恢复', async ({ page }) => {
   await page.goto('/');
   await loadFile(page, 'sample.wav');

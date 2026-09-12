@@ -182,6 +182,28 @@ describe('parseImportPayload 逐条记录校验（复用毫秒边界规则）', 
     }
   });
 
+  it('创建序号达到或超过安全整数上限被拒绝（后续序号无法可靠续接）', () => {
+    for (const createdAt of [
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER + 1,
+      2 ** 60,
+    ]) {
+      const result = importPayload(clipWith({ createdAt }));
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain('第 2 条记录');
+        expect(result.error).toContain('续接');
+      }
+    }
+  });
+
+  it('安全整数上限减一仍可导入，后续序号接在 MAX_SAFE_INTEGER', () => {
+    const result = expectOk(
+      importPayload(clipWith({ createdAt: Number.MAX_SAFE_INTEGER - 1 })),
+    );
+    expect(result.nextCreatedAt).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
   it('记录不是对象或字段类型错误被拒绝', () => {
     expect(importPayload(makePayload({ clips: [null] })).ok).toBe(false);
     expect(importPayload(makePayload({ clips: ['文本'] })).ok).toBe(false);

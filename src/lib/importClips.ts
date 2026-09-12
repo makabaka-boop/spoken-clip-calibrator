@@ -20,8 +20,9 @@ export type ImportResult = ImportSuccess | ImportFailure;
  * 校验并还原本工具此前导出的片段 JSON。
  *
  * 复用与打点/导出完全相同的规则：标签非空、0 ≤ 起点 < 终点 ≤ 取整后时长
- * （整数毫秒）、创建序号为非负整数且不重复。同时核对音频文件名与取整后
- * 时长，确保导入对象就是当前载入的这段录音。
+ * （整数毫秒）、创建序号为非负整数、不重复，且小于 Number.MAX_SAFE_INTEGER
+ * （再大一步后续序号就无法可靠续接，新记录会复用已有序号）。同时核对音频
+ * 文件名与取整后时长，确保导入对象就是当前载入的这段录音。
  *
  * 全部记录通过才返回 clips；任一失败只返回错误原因，绝不产生部分结果，
  * 调用方据此保证“不改动导入前的清单、选择与播放位置”。
@@ -90,6 +91,13 @@ export function parseImportPayload(
     }
     if (typeof r.createdAt !== 'number' || !Number.isInteger(r.createdAt) || r.createdAt < 0) {
       return { ok: false, error: `${nth}的创建序号必须是非负整数。` };
+    }
+    // 续接要求 max + 1 仍是安全整数；达到上限的会话继续新增会复用已有序号。
+    if (r.createdAt >= Number.MAX_SAFE_INTEGER) {
+      return {
+        ok: false,
+        error: `${nth}的创建序号 ${r.createdAt} 过大，后续创建序号无法可靠续接。`,
+      };
     }
     if (seenCreatedAt.has(r.createdAt)) {
       return { ok: false, error: `创建序号重复：${nth}的 createdAt = ${r.createdAt} 已出现过。` };

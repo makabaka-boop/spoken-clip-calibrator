@@ -158,21 +158,35 @@ export default function App() {
       importingRef.current = true;
       setIsImporting(true);
       setError(null);
+      // 读取/校验是异步的：立即暂停播放并记下导入前位置。
+      // 失败时恢复到此位置；成功时被替换片段的试听也就此停止。
+      const el = audioRef.current;
+      const positionBeforeImportMs = el ? toMillis(el.currentTime) : 0;
+      if (loopResumeTimerRef.current !== null) {
+        window.clearTimeout(loopResumeTimerRef.current);
+        loopResumeTimerRef.current = null;
+      }
+      if (el && !el.paused) el.pause();
       try {
         const text = await file.text();
         // 读取期间更换了音频：旧音频对应的导入结果直接放弃。
         if (loadedAudioRef.current !== audio) return;
         const result = parseImportPayload(text, audio.file.name, audio.durationMs);
         if (!result.ok) {
-          // 解析失败 / 音频不匹配 / 序号重复 / 记录越界：就地报错，现状不变。
+          // 解析失败 / 音频不匹配 / 序号重复 / 记录越界：就地报错，
+          // 清单与选择不变，播放位置恢复为导入前（保持暂停）。
           setError(result.error);
+          if (el) {
+            if (!el.paused) el.pause();
+            internalSeekRef.current = true;
+            el.currentTime = positionBeforeImportMs / 1000;
+            setCurrentMs(positionBeforeImportMs);
+          }
           return;
         }
-        // 全部记录通过：一次性替换清单并选中首条；试听目标随清单作废旧。
-        if (loopResumeTimerRef.current !== null) {
-          window.clearTimeout(loopResumeTimerRef.current);
-          loopResumeTimerRef.current = null;
-        }
+        // 全部记录通过：一次性替换清单并选中首条；试听目标随清单作废旧，
+        // 且音频保持暂停——被替换片段的试听不会在新清单下继续发声。
+        if (el && !el.paused) el.pause();
         auditionRef.current = null;
         setAuditionId(null);
         // 后续创建序号接在已有最大值之后。
