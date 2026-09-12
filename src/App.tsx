@@ -7,6 +7,7 @@ import {
   exportClipsAsJson,
   type Clip,
 } from './lib/clips';
+import { parseImportPayload } from './lib/importClips';
 import { formatTimecode, toMillis, validateBoundaries, validateLabel } from './lib/time';
 
 interface LoadedAudio {
@@ -32,7 +33,13 @@ export default function App() {
   const [auditionId, setAuditionId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const createdCountRef = useRef(0);
+  // 导入读取/校验期间为 true：界面显示处理中，并阻止重复触发。
+  const [isImporting, setIsImporting] = useState(false);
+  const importingRef = useRef(false);
+  // 导入是异步的：读取期间若用户更换了音频，据此放弃过期结果。
+  const loadedAudioRef = useRef<LoadedAudio | null>(null);
   // 区分用户拖动进度条（或程序定位）与普通 timeupdate。
   const internalSeekRef = useRef(false);
   const auditionRef = useRef<string | null>(null);
@@ -47,6 +54,10 @@ export default function App() {
   useEffect(() => {
     clipsRef.current = clips;
   }, [clips]);
+
+  useEffect(() => {
+    loadedAudioRef.current = audio;
+  }, [audio]);
 
   /* ------------------------------ 播放位置观测 ------------------------------ */
   // 以 requestAnimationFrame 在播放中持续读取原始 currentTime，保证在
@@ -135,6 +146,52 @@ export default function App() {
   const onFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) void handleFile(file);
+  };
+
+  /* ------------------------------ 导入片段 JSON ------------------------------ */
+  // 载入原音频后，可选择本工具此前导出的 .clips.json 恢复清单继续工作。
+  // 校验全部通过才一次性替换清单；任何失败都不改动清单、选择与播放位置。
+
+  const handleImportFile = useCallback(
+    async (file: File) => {
+      if (!audio || importingRef.current) return;
+      importingRef.current = true;
+      setIsImporting(true);
+      setError(null);
+      try {
+        const text = await file.text();
+        // 读取期间更换了音频：旧音频对应的导入结果直接放弃。
+        if (loadedAudioRef.current !== audio) return;
+        const result = parseImportPayload(text, audio.file.name, audio.durationMs);
+        if (!result.ok) {
+          // 解析失败 / 音频不匹配 / 序号重复 / 记录越界：就地报错，现状不变。
+          setError(result.error);
+          return;
+        }
+        // 全部记录通过：一次性替换清单并选中首条；试听目标随清单作废旧。
+        if (loopResumeTimerRef.current !== null) {
+          window.clearTimeout(loopResumeTimerRef.current);
+          loopResumeTimerRef.current = null;
+        }
+        auditionRef.current = null;
+        setAuditionId(null);
+        // 后续创建序号接在已有最大值之后。
+        createdCountRef.current = result.nextCreatedAt;
+        setClips(result.clips);
+        setSelectedId(result.clips[0]?.id ?? null);
+      } finally {
+        importingRef.current = false;
+        setIsImporting(false);
+        // 允许再次选择同一文件。
+        if (importInputRef.current) importInputRef.current.value = '';
+      }
+    },
+    [audio],
+  );
+
+  const onImportInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) void handleImportFile(file);
   };
 
   /* --------------------------------- 播放控制 --------------------------------- */
@@ -327,6 +384,31 @@ export default function App() {
         )}
       </section>
 
+      <section className="panel" aria-label="恢复上次工作">
+        <h2>恢复上次工作（导入片段 JSON）</h2>
+        <div className="import-row">
+          <input
+            ref={importInputRef}
+            id="import-input"
+            data-testid="import-input"
+            type="file"
+            accept="application/json,.json"
+            disabled={!audio || isImporting}
+            onChange={onImportInputChange}
+          />
+          {isImporting && (
+            <span className="muted" data-testid="import-status">
+              正在读取并校验导入文件…
+            </span>
+          )}
+          {!audio && !isImporting && (
+            <span className="muted" data-testid="import-hint">
+              先载入原音频，再选择此前导出的 .clips.json；校验通过才会替换当前清单。
+            </span>
+          )}
+        </div>
+      </section>
+
       <section className="panel" aria-label="播放器">
         <audio
           ref={audioRef}
@@ -473,7 +555,11 @@ export default function App() {
           >
             导出 JSON（按起点、终点、创建序号升序）
           </button>
-          {selectedClip && <span className="muted">已选片段创建序号：{selectedClip.createdAt}</span>}
+          {selectedClip && (
+            <span className="muted" data-testid="selected-created-at">
+              已选片段创建序号：{selectedClip.createdAt}
+            </span>
+          )}
         </div>
         {exportPreview && (
           <pre className="export-preview" data-testid="export-preview">

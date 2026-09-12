@@ -22,6 +22,13 @@
    - 试听从记录起点开始；以 `requestAnimationFrame` 逐帧观测，**首次**看到 `round(currentTime*1000) ≥ 终点` 立即暂停并把游标复位到精确起点，稍作停留后自动从头循环。
    - 「停止试听」暂停并停在精确起点——验收者可直接看到游标复位。
 4. 「导出 JSON」下载 `<音频主名>.clips.json`，片段按 **起点 → 终点 → 创建序号** 升序排列。
+5. 下次继续时：重新载入同一段原音频，在「恢复上次工作」中选择此前导出的 `.clips.json`。
+   - 导入复用同一份毫秒边界规则逐条校验：音频文件名、取整后时长、标签、起止值、创建序号
+     （非负整数且不重复）。
+   - **全部记录通过**才一次性替换当前清单并选中首条；后续新片段的创建序号接在已有最大值之后。
+   - 文件无法解析、音频不匹配、序号重复或任一记录越界：就地指出原因，**导入前的清单、
+     选择与播放位置都不变**，不产生部分恢复。
+   - 读取与校验期间界面显示处理中，导入输入暂时禁用，避免重复触发。
 
 导出示例：
 
@@ -51,9 +58,9 @@ npm ci
 npm run dev          # 开发服务器
 npm run build        # tsc --noEmit + vite 构建
 npm run preview      # 托管 dist（容器内同此命令）
-npm run test         # Vitest：取整与边界（src/**/*.test.ts）
+npm run test         # Vitest：取整与边界、导入载荷校验与序号续接（src/**/*.test.ts）
 npm run make:audio   # 重新生成 test-assets/sample.wav（3.25s / 8kHz / 单声道 PCM16）
-npm run test:e2e     # Playwright：打点、循环试听复位、错误、导出
+npm run test:e2e     # Playwright：打点、循环试听复位、错误、导出、导入恢复
 npm run verify       # Vitest + build + Playwright 一条龙
 ```
 

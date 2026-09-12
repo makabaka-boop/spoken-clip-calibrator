@@ -152,7 +152,8 @@ button.danger:hover:not(:disabled) {
 
 .capture-row,
 .label-row,
-.export-row {
+.export-row,
+.import-row {
   display: flex;
   gap: 12px;
   align-items: center;
