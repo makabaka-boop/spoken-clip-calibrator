@@ -1,0 +1,30 @@
+{
+  "name": "oral-history-clip-calibrator",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "纯前端口述史录音片段切取校准器：本地打点、毫秒级时间码、试听与 JSON 导出，不上传任何文件。",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 8080 --strictPort",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "make:audio": "node scripts/make-test-audio.mjs",
+    "test:e2e": "playwright test",
+    "verify": "npm run test && npm run build && playwright test"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2",
+    "@types/react": "18.3.11",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.3",
+    "typescript": "5.6.3",
+    "vite": "5.4.10",
+    "vitest": "2.1.5"
+  }
+}

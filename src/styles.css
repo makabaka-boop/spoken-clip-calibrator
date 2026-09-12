@@ -1,0 +1,248 @@
+:root {
+  color-scheme: light dark;
+  --bg: #14161c;
+  --panel: #1d212b;
+  --panel-2: #242a36;
+  --text: #e8ebf0;
+  --muted: #9aa3b2;
+  --accent: #5aa7ff;
+  --danger: #ff6b6b;
+  --ok: #4cc38a;
+  --border: #333a48;
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 24px 20px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.header h1 {
+  margin: 0 0 6px;
+  font-size: 24px;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.panel h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.audio-meta {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 14px;
+}
+
+.file-name {
+  font-weight: 600;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.45);
+  color: #ffb3b3;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+audio {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.transport {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.transport input[type='range'] {
+  flex: 1;
+}
+
+.time-readout {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  margin-top: 10px;
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  flex-wrap: wrap;
+}
+
+.audition-badge {
+  font-size: 12px;
+  color: var(--ok);
+  border: 1px solid rgba(76, 195, 138, 0.5);
+  background: rgba(76, 195, 138, 0.1);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.danger {
+  color: #ffb3b3;
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+}
+
+.capture-row,
+.label-row,
+.export-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.capture-row {
+  margin-bottom: 12px;
+}
+
+.captured {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  min-width: 180px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.label-row input[type='text'] {
+  flex: 1;
+  min-width: 240px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.clip-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.clip-item {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  flex-wrap: wrap;
+}
+
+.clip-item.selected {
+  border-color: var(--accent);
+}
+
+.clip-item.auditioning {
+  box-shadow: 0 0 0 1px var(--ok) inset;
+}
+
+.clip-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 240px;
+}
+
+.clip-label {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.clip-bounds {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.export-preview {
+  margin-top: 12px;
+  background: #10131a;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 12px;
+  overflow: auto;
+  max-height: 320px;
+}
+
+.footer {
+  font-size: 12px;
+  line-height: 1.6;
+}

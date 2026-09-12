@@ -1,0 +1,490 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { probeAudioFile } from './lib/audio';
+import {
+  buildExportPayload,
+  createClipId,
+  downloadBlob,
+  exportClipsAsJson,
+  type Clip,
+} from './lib/clips';
+import { formatTimecode, toMillis, validateBoundaries, validateLabel } from './lib/time';
+
+interface LoadedAudio {
+  file: File;
+  url: string;
+  durationMs: number;
+}
+
+export default function App() {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [audio, setAudio] = useState<LoadedAudio | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentMs, setCurrentMs] = useState(0);
+
+  const [pendingStartMs, setPendingStartMs] = useState<number | null>(null);
+  const [pendingEndMs, setPendingEndMs] = useState<number | null>(null);
+  const [label, setLabel] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const [clips, setClips] = useState<Clip[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // 当前正在试听的片段 id；null 表示普通播放/未试听。
+  const [auditionId, setAuditionId] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const createdCountRef = useRef(0);
+  // 区分用户拖动进度条（或程序定位）与普通 timeupdate。
+  const internalSeekRef = useRef(false);
+  const auditionRef = useRef<string | null>(null);
+  // clips 同步给 rAF 闭包读取，避免每帧重建监听。
+  const clipsRef = useRef<Clip[]>([]);
+  const loopResumeTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    auditionRef.current = auditionId;
+  }, [auditionId]);
+
+  useEffect(() => {
+    clipsRef.current = clips;
+  }, [clips]);
+
+  /* ------------------------------ 播放位置观测 ------------------------------ */
+  // 以 requestAnimationFrame 在播放中持续读取原始 currentTime，保证在
+  // 首次达到/越过终点的当帧即可暂停；不向整秒做任何吸附。
+
+  useEffect(() => {
+    if (!audio) return;
+    let frame = 0;
+
+    const tick = () => {
+      frame = requestAnimationFrame(tick);
+      const el = audioRef.current;
+      if (!el) return;
+      const nowMs = toMillis(el.currentTime);
+      setCurrentMs(nowMs);
+
+      const activeId = auditionRef.current;
+      if (activeId && !el.paused) {
+        const active = clipsRef.current.find((c) => c.id === activeId);
+        if (active && nowMs >= active.endMs) {
+          // 首次观测到达到或越过终点：立即暂停并精确回到记录起点。
+          el.pause();
+          internalSeekRef.current = true;
+          el.currentTime = active.startMs / 1000;
+          setCurrentMs(active.startMs);
+          // 循环试听：在起点停留一拍后自动从头再来；期间可被“停止试听”取消。
+          if (loopResumeTimerRef.current !== null) {
+            window.clearTimeout(loopResumeTimerRef.current);
+          }
+          loopResumeTimerRef.current = window.setTimeout(() => {
+            loopResumeTimerRef.current = null;
+            const stillEl = audioRef.current;
+            if (stillEl && auditionRef.current === active.id) {
+              void stillEl.play().catch(() => {
+                /* 用户手动暂停等情况，忽略 */
+              });
+            }
+          }, 450);
+        }
+      }
+    };
+    frame = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(frame);
+      if (loopResumeTimerRef.current !== null) {
+        window.clearTimeout(loopResumeTimerRef.current);
+        loopResumeTimerRef.current = null;
+      }
+    };
+  }, [audio]);
+
+  /* ------------------------------- 加载本地音频 ------------------------------- */
+
+  const handleFile = useCallback(async (file: File) => {
+    setError(null);
+    const result = await probeAudioFile(file);
+    if (!result.ok || result.durationMs === undefined) {
+      // 不可解码：就地报错，不改变已有音频与片段清单。
+      setError(result.error ?? '文件无法解码为音频。');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+    // 新音频有效：回收旧 object URL，重置全部打点/播放状态。
+    const url = URL.createObjectURL(file);
+    setAudio((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return { file, url, durationMs: result.durationMs as number };
+    });
+    if (loopResumeTimerRef.current !== null) {
+      window.clearTimeout(loopResumeTimerRef.current);
+      loopResumeTimerRef.current = null;
+    }
+    auditionRef.current = null;
+    createdCountRef.current = 0;
+    setClips([]);
+    setSelectedId(null);
+    setAuditionId(null);
+    setPendingStartMs(null);
+    setPendingEndMs(null);
+    setLabel('');
+    setCurrentMs(0);
+    setIsPlaying(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }, []);
+
+  const onFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) void handleFile(file);
+  };
+
+  /* --------------------------------- 播放控制 --------------------------------- */
+
+  const togglePlay = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (el.paused) {
+      void el.play().catch(() => {
+        setError('浏览器拒绝了自动播放，请再次点击播放。');
+      });
+    } else {
+      el.pause();
+    }
+  };
+
+  // 用户拖动进度条（change 时才真正定位，避免与 rAF 写回竞争）。
+  const onScrubberChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const el = audioRef.current;
+    if (!el || !audio) return;
+    const ms = Number(event.target.value);
+    internalSeekRef.current = true;
+    el.currentTime = ms / 1000;
+    setCurrentMs(ms);
+  };
+
+  const onTimeUpdate = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (internalSeekRef.current) {
+      internalSeekRef.current = false;
+      return;
+    }
+    setCurrentMs(toMillis(el.currentTime));
+  };
+
+  const onEnded = () => {
+    // 自然播完：取消试听态，保留在媒体末端。
+    setIsPlaying(false);
+    setAuditionId(null);
+    auditionRef.current = null;
+  };
+
+  /* ---------------------------------- 打点 ---------------------------------- */
+
+  const captureStart = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    setError(null);
+    setPendingStartMs(toMillis(el.currentTime));
+  };
+
+  const captureEnd = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    setError(null);
+    setPendingEndMs(toMillis(el.currentTime));
+  };
+
+  const addClip = () => {
+    if (!audio) return;
+    setError(null);
+    const labelError = validateLabel(label);
+    if (!labelError.ok) {
+      setError(labelError.error ?? '标签不合法。');
+      return;
+    }
+    if (pendingStartMs === null || pendingEndMs === null) {
+      setError('请先在播放中分别捕获起点与终点。');
+      return;
+    }
+    const boundaryError = validateBoundaries(pendingStartMs, pendingEndMs, audio.durationMs);
+    if (!boundaryError.ok) {
+      // 相等/反向/越界：就地报错，清单保持不变。
+      setError(boundaryError.error ?? '边界不合法。');
+      return;
+    }
+    const clip: Clip = {
+      id: createClipId(),
+      startMs: pendingStartMs,
+      endMs: pendingEndMs,
+      label: label.trim(),
+      createdAt: createdCountRef.current,
+    };
+    createdCountRef.current += 1;
+    setClips((prev) => [...prev, clip]);
+    setSelectedId(clip.id);
+    setPendingStartMs(null);
+    setPendingEndMs(null);
+    setLabel('');
+  };
+
+  /* ------------------------------- 清单：试听/删除 ------------------------------ */
+
+  const auditionClip = useCallback((clip: Clip) => {
+    const el = audioRef.current;
+    if (!el) return;
+    setError(null);
+    if (loopResumeTimerRef.current !== null) {
+      window.clearTimeout(loopResumeTimerRef.current);
+      loopResumeTimerRef.current = null;
+    }
+    // 试听必须从记录起点开始。
+    internalSeekRef.current = true;
+    el.currentTime = clip.startMs / 1000;
+    setCurrentMs(clip.startMs);
+    auditionRef.current = clip.id;
+    setAuditionId(clip.id);
+    void el.play().catch(() => {
+      setError('浏览器拒绝了播放，请再次点击试听。');
+    });
+  }, []);
+
+  const stopClipAudition = useCallback((clipId: string) => {
+    if (auditionRef.current !== clipId) return;
+    const el = audioRef.current;
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    auditionRef.current = null;
+    setAuditionId(null);
+    if (loopResumeTimerRef.current !== null) {
+      window.clearTimeout(loopResumeTimerRef.current);
+      loopResumeTimerRef.current = null;
+    }
+    if (el && !el.paused) el.pause();
+    // 停在精确起点，便于验收者核对游标。
+    if (el && clip) {
+      internalSeekRef.current = true;
+      el.currentTime = clip.startMs / 1000;
+      setCurrentMs(clip.startMs);
+    }
+  }, []);
+
+  const deleteClip = (id: string) => {
+    if (auditionRef.current === id) stopClipAudition(id);
+    setClips((prev) => prev.filter((c) => c.id !== id));
+    setSelectedId((prev) => (prev === id ? null : prev));
+  };
+
+  /* ---------------------------------- 导出 ---------------------------------- */
+
+  const exportPayload = useMemo(
+    () => (audio ? buildExportPayload(clips, audio.file.name, audio.durationMs) : null),
+    [audio, clips],
+  );
+  const exportPreview = exportPayload ? JSON.stringify(exportPayload, null, 2) : '';
+
+  const handleExport = () => {
+    if (!audio || clips.length === 0) return;
+    const payload = buildExportPayload(clips, audio.file.name, audio.durationMs);
+    const base = audio.file.name.replace(/\.[^.]+$/, '') || 'audio';
+    downloadBlob(exportClipsAsJson(payload), `${base}.clips.json`);
+  };
+
+  const selectedClip = clips.find((c) => c.id === selectedId) ?? null;
+  const auditioningClip = clips.find((c) => c.id === auditionId) ?? null;
+  const progressValue = audio ? Math.min(currentMs, audio.durationMs) : 0;
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>口述史片段切取校准器</h1>
+        <p className="subtitle">
+          录音仅在本机读取，不会上传或访问任何在线服务；时间码为 currentTime × 1000
+          四舍五入的整数毫秒。
+        </p>
+      </header>
+
+      <section className="panel" aria-label="音频载入">
+        <input
+          ref={fileInputRef}
+          id="file-input"
+          data-testid="file-input"
+          type="file"
+          accept="audio/*"
+          onChange={onFileInputChange}
+        />
+        {audio && (
+          <div className="audio-meta" data-testid="audio-meta">
+            <span className="file-name" title={audio.file.name}>
+              {audio.file.name}
+            </span>
+            <span data-testid="duration-ms">时长 {audio.durationMs} ms</span>
+            <span className="muted">（{formatTimecode(audio.durationMs)}）</span>
+          </div>
+        )}
+        {error && (
+          <div className="error" role="alert" data-testid="error">
+            {error}
+          </div>
+        )}
+      </section>
+
+      <section className="panel" aria-label="播放器">
+        <audio
+          ref={audioRef}
+          data-testid="audio-element"
+          src={audio?.url}
+          preload="auto"
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onTimeUpdate={onTimeUpdate}
+          onEnded={onEnded}
+        />
+        <div className="transport" data-playing={isPlaying}>
+          <button type="button" data-testid="play-button" onClick={togglePlay} disabled={!audio}>
+            {isPlaying ? '暂停' : '播放'}
+          </button>
+          <input
+            type="range"
+            data-testid="scrubber"
+            min={0}
+            max={audio?.durationMs ?? 0}
+            step={1}
+            value={progressValue}
+            disabled={!audio}
+            onChange={onScrubberChange}
+            aria-label="播放进度（毫秒）"
+          />
+        </div>
+        <div className="time-readout">
+          <span data-testid="current-timecode">{formatTimecode(currentMs)}</span>
+          <span className="muted" data-testid="current-ms">
+            {currentMs} ms
+          </span>
+          {auditioningClip && (
+            <span className="audition-badge" data-testid="audition-badge">
+              试听中：{auditioningClip.label}（{auditioningClip.startMs}–{auditioningClip.endMs}{' '}
+              ms）
+            </span>
+          )}
+        </div>
+      </section>
+
+      <section className="panel" aria-label="打点表单">
+        <div className="capture-row">
+          <button type="button" data-testid="capture-start" onClick={captureStart} disabled={!audio}>
+            捕获起点
+          </button>
+          <div className="captured" data-testid="pending-start">
+            {pendingStartMs === null
+              ? '起点未捕获'
+              : `${pendingStartMs} ms（${formatTimecode(pendingStartMs)}）`}
+          </div>
+          <button type="button" data-testid="capture-end" onClick={captureEnd} disabled={!audio}>
+            捕获终点
+          </button>
+          <div className="captured" data-testid="pending-end">
+            {pendingEndMs === null
+              ? '终点未捕获'
+              : `${pendingEndMs} ms（${formatTimecode(pendingEndMs)}）`}
+          </div>
+        </div>
+        <div className="label-row">
+          <label htmlFor="label-input">标签（必填，非空）</label>
+          <input
+            id="label-input"
+            data-testid="label-input"
+            type="text"
+            value={label}
+            placeholder="例如：受访者讲述搬迁那年的片段"
+            onChange={(e) => setLabel(e.target.value)}
+          />
+          <button type="button" data-testid="add-clip" onClick={addClip} disabled={!audio}>
+            加入片段
+          </button>
+        </div>
+      </section>
+
+      <section className="panel" aria-label="片段清单">
+        <h2>片段清单（{clips.length}）</h2>
+        {clips.length === 0 ? (
+          <p className="muted" data-testid="empty-list">
+            还没有片段。播放录音，分别捕获起点、终点并填写标签后加入。
+          </p>
+        ) : (
+          <ul className="clip-list" data-testid="clip-list">
+            {clips.map((clip) => (
+              <li
+                key={clip.id}
+                className={`clip-item ${selectedId === clip.id ? 'selected' : ''} ${
+                  auditionId === clip.id ? 'auditioning' : ''
+                }`}
+                data-testid="clip-item"
+                data-clip-id={clip.id}
+              >
+                <label className="clip-select">
+                  <input
+                    type="radio"
+                    name="selected-clip"
+                    data-testid="clip-select"
+                    checked={selectedId === clip.id}
+                    onChange={() => setSelectedId(clip.id)}
+                  />
+                </label>
+                <div className="clip-info">
+                  <span className="clip-label" data-testid="clip-label">
+                    {clip.label}
+                  </span>
+                  <span className="clip-bounds" data-testid="clip-bounds">
+                    {clip.startMs} ms → {clip.endMs} ms（长 {clip.endMs - clip.startMs} ms，
+                    {formatTimecode(clip.startMs)} – {formatTimecode(clip.endMs)}）
+                  </span>
+                </div>
+                <button type="button" data-testid="audition-clip" onClick={() => auditionClip(clip)}>
+                  循环试听
+                </button>
+                <button
+                  type="button"
+                  data-testid="stop-audition"
+                  onClick={() => stopClipAudition(clip.id)}
+                  disabled={auditionId !== clip.id}
+                >
+                  停止试听
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  data-testid="delete-clip"
+                  onClick={() => deleteClip(clip.id)}
+                >
+                  删除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel" aria-label="导出">
+        <div className="export-row">
+          <button
+            type="button"
+            data-testid="export-json"
+            onClick={handleExport}
+            disabled={!audio || clips.length === 0}
+          >
+            导出 JSON（按起点、终点、创建序号升序）
+          </button>
+          {selectedClip && <span className="muted">已选片段创建序号：{selectedClip.createdAt}</span>}
+        </div>
+        {exportPreview && (
+          <pre className="export-preview" data-testid="export-preview">
+            {exportPreview}
+          </pre>
+        )}
+      </section>
+
+      <footer className="footer muted">
+        试听规则：从记录起点开始播放，首次观测到当前毫秒 ≥ 终点即暂停并回到起点，随后循环；全程不吸附整秒。
+      </footer>
+    </div>
+  );
+}

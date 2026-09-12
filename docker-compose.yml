@@ -1,0 +1,19 @@
+# 纯前端应用：页面由 vite preview 托管，音频文件只经浏览器在本机读取。
+services:
+  web:
+    build: .
+    image: oral-history-clip-calibrator
+    # 宿主端口可用 WEB_PORT 覆盖，默认 8080；容器内固定 8080。
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # 一次性验收：单元测试（Vitest 取整与边界）+ 构建 + Playwright 端到端。
+  # 运行：docker compose --profile verify run --rm verify
+  verify:
+    image: oral-history-clip-calibrator
+    build: .
+    profiles: ["verify"]
+    environment:
+      CI: "true"
+    command: ["npm", "run", "verify"]
