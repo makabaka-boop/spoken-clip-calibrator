@@ -113,6 +113,60 @@ audio {
   flex-wrap: wrap;
 }
 
+/* ------------------------------ 整段振幅概览 ------------------------------ */
+
+.envelope-head {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.envelope-head h2 {
+  margin: 0;
+}
+
+.envelope-status {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  line-height: 1.5;
+}
+
+.envelope-error {
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.45);
+  color: #ffb3b3;
+}
+
+.envelope-canvas-wrap {
+  width: 100%;
+  min-width: 0;
+}
+
+.envelope-canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: crosshair;
+  outline: none;
+}
+
+.envelope-canvas-wrap canvas:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(90, 167, 255, 0.35);
+}
+
+.envelope-hint {
+  margin: 8px 0 0;
+  min-height: 18px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
 .audition-badge {
   font-size: 12px;
   color: var(--ok);

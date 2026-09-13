@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import AudioEnvelopePanel from './components/AudioEnvelopePanel';
 import { probeAudioFile } from './lib/audio';
+import {
+  analyzeAudioEnvelope,
+  type AudioEnvelope,
+  type AudioEnvelopeState,
+} from './lib/audioEnvelope';
 import {
   buildExportPayload,
   createClipId,
@@ -27,6 +33,9 @@ interface LoadedAudio {
   url: string;
   durationMs: number;
 }
+
+// 整段峰值轮廓的等分桶数：只影响轮廓数据粒度，与画布尺寸/播放进度无关。
+const ENVELOPE_BUCKET_COUNT = 240;
 
 export default function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -56,6 +65,13 @@ export default function App() {
   const [editLabel, setEditLabel] = useState('');
   // 校验失败原因只在编辑区内指出，与打点表单的全局 error 互不干扰。
   const [editError, setEditError] = useState<string | null>(null);
+
+  // 独立的整段振幅概览：分析中 / 可用 / 失败三态；失败只在概览区说明原因，
+  // 不清空片段、选择或已加载音频。更换音频时清除旧概览并忽略迟到结果。
+  const [envelope, setEnvelope] = useState<AudioEnvelope | null>(null);
+  const [envelopeState, setEnvelopeState] = useState<AudioEnvelopeState>('analyzing');
+  const [envelopeError, setEnvelopeError] = useState<string | null>(null);
+  const envelopeRunRef = useRef(0);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
@@ -89,6 +105,44 @@ export default function App() {
 
   useEffect(() => {
     loadedAudioRef.current = audio;
+  }, [audio]);
+
+  /* ------------------------------ 整段振幅概览 ------------------------------ */
+  // 音频载入后自动分析：浏览器本地离线解码，按时长等分各声道绝对峰值。
+  // 更换音频会清除旧概览，并以递增 run id 忽略上一段音频的迟到结果；
+  // 分析失败只在概览区说明，片段、选择与已加载音频一律不变。
+  useEffect(() => {
+    if (!audio) {
+      envelopeRunRef.current += 1;
+      setEnvelope(null);
+      setEnvelopeError(null);
+      setEnvelopeState('analyzing');
+      return;
+    }
+    const runId = envelopeRunRef.current + 1;
+    envelopeRunRef.current = runId;
+    setEnvelope(null);
+    setEnvelopeError(null);
+    setEnvelopeState('analyzing');
+    let cancelled = false;
+
+    void analyzeAudioEnvelope(audio.file, ENVELOPE_BUCKET_COUNT).then((result) => {
+      // 更换音频（effect cleanup）后到达的旧结果直接丢弃。
+      if (cancelled || envelopeRunRef.current !== runId) return;
+      if (result.ok && result.envelope) {
+        setEnvelope(result.envelope);
+        setEnvelopeError(null);
+        setEnvelopeState('available');
+      } else {
+        setEnvelope(null);
+        setEnvelopeError(result.error ?? '振幅概览分析失败。');
+        setEnvelopeState('failed');
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [audio]);
 
   /* ------------------------------ 播放位置观测 ------------------------------ */
@@ -251,6 +305,11 @@ export default function App() {
     setLabel('');
     setCurrentMs(0);
     setIsPlaying(false);
+    // 更换音频：清除旧概览，使上一段音频迟到的分析结果作废（effect 会再次置位）。
+    envelopeRunRef.current += 1;
+    setEnvelope(null);
+    setEnvelopeError(null);
+    setEnvelopeState('analyzing');
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, [clearSequentialSwitchTimer]);
 
@@ -329,6 +388,32 @@ export default function App() {
   };
 
   /* --------------------------------- 播放控制 --------------------------------- */
+
+  // 振幅概览定位：定位前结束正在进行的单条循环试听或顺序审听（含各自的
+  // 自动续播/切换定时器），再把共享播放器定位到换算并钳制后的整数毫秒。
+  // 不改变片段、选择或校准编辑态；播放器保持暂停，用户自行继续播放。
+  const seekFromEnvelope = useCallback(
+    (ms: number) => {
+      const el = audioRef.current;
+      if (!el || !audio) return;
+      const targetMs = Math.min(audio.durationMs, Math.max(0, Math.round(ms)));
+      if (loopResumeTimerRef.current !== null) {
+        window.clearTimeout(loopResumeTimerRef.current);
+        loopResumeTimerRef.current = null;
+      }
+      clearSequentialSwitchTimer();
+      if (!el.paused) el.pause();
+      auditionRef.current = null;
+      setAuditionId(null);
+      const idle = stopSequentialSession(sequentialRef.current);
+      sequentialRef.current = idle;
+      setSequential(idle);
+      internalSeekRef.current = true;
+      el.currentTime = targetMs / 1000;
+      setCurrentMs(targetMs);
+    },
+    [audio, clearSequentialSwitchTimer],
+  );
 
   const togglePlay = () => {
     const el = audioRef.current;
@@ -810,6 +895,19 @@ export default function App() {
           )}
         </div>
       </section>
+
+      {audio && (
+        <section className="panel" aria-label="整段振幅概览">
+          <AudioEnvelopePanel
+            durationMs={audio.durationMs}
+            envelope={envelope}
+            state={envelopeState}
+            error={envelopeError}
+            currentMs={currentMs}
+            onSeek={seekFromEnvelope}
+          />
+        </section>
+      )}
 
       <section className="panel" aria-label="打点表单">
         <div className="capture-row">
