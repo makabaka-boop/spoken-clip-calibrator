@@ -57,6 +57,21 @@ async function positionMs(page: Page): Promise<number> {
     .evaluate((el: HTMLAudioElement) => el.currentTime * 1000);
 }
 
+// 以原生 setter 写入并派发 input/change，模拟用户拖动共享游标（React 受控 range）。
+async function dragScrubberTo(page: Page, ms: number) {
+  await page
+    .locator('[data-testid="scrubber"]')
+    .evaluate((el: HTMLInputElement, value: number) => {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'value',
+      )!.set!;
+      setter.call(el, String(value));
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }, ms);
+}
+
 test.beforeEach(async ({ page }) => {
   // 纯前端红线：除 data:/blob:/同源页面资源外，任何外部网络请求都视为失败。
   await page.route('**/*', (route) => {
@@ -269,6 +284,186 @@ test.describe('顺序审听', () => {
     await expect.poll(() => isPaused(page), { timeout: 3000, intervals: [16] }).toBe(true);
     expect(Math.abs((await positionMs(page)) - jia.startMs)).toBeLessThanOrEqual(1);
     await expect(page.locator('[data-testid="sequential-badge"]')).toHaveCount(0);
+  });
+});
+
+test.describe('顺序审听会话与共享播放器/打点的一致性', () => {
+  test('播放当前片段时点共享“暂停”：会话同步退出审听，不再推进', async ({ page }) => {
+    await addClipViaUi(page, 0.2, 1.5, '乙：前段');
+    await addClipViaUi(page, 2.0, 2.5, '甲：后段');
+    const items = page.locator('[data-testid="clip-item"]');
+    const itemYi = items.nth(0);
+    const itemJia = items.nth(1);
+    const yi = readBounds(await itemYi.locator('[data-testid="clip-bounds"]').textContent());
+
+    await itemYi.locator('[data-testid="clip-select"]').check();
+    await page.locator('[data-testid="sequential-audition"]').click();
+    const badge = page.locator('[data-testid="sequential-badge"]');
+    await expect(badge).toBeVisible();
+    await expect(badge).toContainText('1/2');
+
+    // 等进入乙的播放中段，再点共享播放器的“暂停”
+    await expect
+      .poll(() => currentMs(page), { timeout: 2000, intervals: [16] })
+      .toBeGreaterThanOrEqual(yi.startMs + 150);
+    await page.locator('[data-testid="play-button"]').click();
+
+    // 音频停止，会话同步退出：徽标消失、入口恢复可用、选择保留在乙
+    expect(await isPaused(page)).toBe(true);
+    await expect(page.locator('[data-testid="play-button"]')).toHaveText('播放');
+    await expect(badge).toHaveCount(0);
+    await expect(page.locator('[data-testid="sequential-audition"]')).toBeEnabled();
+    await expect(itemYi).toHaveClass(/selected/);
+    // 游标停在用户暂停处，不被拉回片段起点
+    expect(await positionMs(page)).toBeGreaterThan(yi.startMs + 50);
+
+    // 会话已退出：不再自动推进到甲，也不再发声
+    await page.waitForTimeout(700);
+    expect(await isPaused(page)).toBe(true);
+    await expect(badge).toHaveCount(0);
+    await expect(itemJia).not.toHaveClass(/selected/);
+    await expect(itemYi).toHaveClass(/selected/);
+  });
+
+  test('播放当前记录时拖动共享游标越过终点：不提前结算，依照既定边界完成审听', async ({
+    page,
+  }) => {
+    await addClipViaUi(page, 0.2, 0.9, '乙：前段');
+    await addClipViaUi(page, 2.0, 2.5, '甲：后段');
+    const items = page.locator('[data-testid="clip-item"]');
+    const itemYi = items.nth(0);
+    const itemJia = items.nth(1);
+    const yi = readBounds(await itemYi.locator('[data-testid="clip-bounds"]').textContent());
+    const jia = readBounds(await itemJia.locator('[data-testid="clip-bounds"]').textContent());
+
+    await itemYi.locator('[data-testid="clip-select"]').check();
+    await page.locator('[data-testid="sequential-audition"]').click();
+    const badge = page.locator('[data-testid="sequential-badge"]');
+    await expect(badge).toBeVisible();
+    await expect
+      .poll(() => currentMs(page), { timeout: 2000, intervals: [16] })
+      .toBeGreaterThanOrEqual(yi.startMs + 100);
+
+    // 拖动共享游标越过乙的终点：不得提前结算并推进
+    await dragScrubberTo(page, yi.endMs + 600);
+    // 会话仍在播放当前片段（1/2），选择仍在乙，媒体未暂停，游标回到乙范围内
+    await expect(badge).toContainText('播放当前片段');
+    await expect(badge).toContainText('1/2');
+    await expect(itemYi).toHaveClass(/selected/);
+    expect(await isPaused(page)).toBe(false);
+    expect(await positionMs(page)).toBeLessThan(yi.endMs);
+
+    // 乙依照既定边界播到终点后才推进：先暂停复位（切换停留），再选中并播放甲
+    await expect.poll(() => isPaused(page), { timeout: 3000, intervals: [16] }).toBe(true);
+    expect(Math.abs((await positionMs(page)) - yi.startMs)).toBeLessThanOrEqual(1);
+    await expect(badge).toContainText('切换下一片段');
+    await expect(itemJia).toHaveClass(/selected/, { timeout: 2000 });
+    await expect(badge).toContainText('2/2');
+    await expect.poll(() => isPaused(page), { timeout: 2000, intervals: [16] }).toBe(false);
+
+    // 末条甲结束：停在甲起点并退出
+    await expect.poll(() => isPaused(page), { timeout: 3000, intervals: [16] }).toBe(true);
+    expect(Math.abs((await positionMs(page)) - jia.startMs)).toBeLessThanOrEqual(1);
+    await expect(badge).toHaveCount(0);
+  });
+
+  test('切换停留期间点共享“播放”：只播放即将推进的下一条', async ({ page }) => {
+    const audio = page.locator('[data-testid="audio-element"]');
+    await addClipViaUi(page, 0.2, 0.6, '乙：前段');
+    await addClipViaUi(page, 2.0, 2.5, '甲：后段');
+    const items = page.locator('[data-testid="clip-item"]');
+    const itemYi = items.nth(0);
+    const itemJia = items.nth(1);
+    const yi = readBounds(await itemYi.locator('[data-testid="clip-bounds"]').textContent());
+    const jia = readBounds(await itemJia.locator('[data-testid="clip-bounds"]').textContent());
+
+    // 记录每次真正进入播放（play 事件）时的媒体位置
+    await audio.evaluate((el: HTMLAudioElement) => {
+      const w = window as unknown as { __playTimes: number[] };
+      w.__playTimes = [];
+      el.addEventListener('play', () => w.__playTimes.push(el.currentTime * 1000));
+    });
+
+    await itemYi.locator('[data-testid="clip-select"]').check();
+    await page.locator('[data-testid="sequential-audition"]').click();
+    const badge = page.locator('[data-testid="sequential-badge"]');
+
+    // 乙播完进入切换停留：暂停在乙起点
+    await expect.poll(() => isPaused(page), { timeout: 3000, intervals: [16] }).toBe(true);
+    await expect(badge).toContainText('切换下一片段');
+    expect(Math.abs((await positionMs(page)) - yi.startMs)).toBeLessThanOrEqual(1);
+
+    // 停留期间点共享“播放”：立即推进到甲，刚结束的乙不会再次发声
+    await page.locator('[data-testid="play-button"]').click();
+    await expect(itemJia).toHaveClass(/selected/);
+    await expect(badge).toContainText('2/2');
+    await expect(badge).toContainText('播放当前片段');
+    expect(await isPaused(page)).toBe(false);
+    const posJia = await positionMs(page);
+    expect(posJia).toBeGreaterThanOrEqual(jia.startMs - 1);
+    expect(posJia).toBeLessThan(jia.endMs);
+
+    // 只有乙起点与甲起点各触发一次播放——乙没有从起点再次发声
+    const playTimes = await page.evaluate(
+      () => (window as unknown as { __playTimes: number[] }).__playTimes,
+    );
+    expect(playTimes).toHaveLength(2);
+    expect(Math.abs(playTimes[0] - yi.startMs)).toBeLessThanOrEqual(1);
+    expect(Math.abs(playTimes[1] - jia.startMs)).toBeLessThanOrEqual(1);
+
+    // 末条甲结束：停在甲起点并退出
+    await expect.poll(() => isPaused(page), { timeout: 3000, intervals: [16] }).toBe(true);
+    expect(Math.abs((await positionMs(page)) - jia.startMs)).toBeLessThanOrEqual(1);
+    await expect(badge).toHaveCount(0);
+  });
+
+  test('顺序审听中捕获并新增片段：选择始终对应播放目标', async ({ page }) => {
+    const audio = page.locator('[data-testid="audio-element"]');
+    await addClipViaUi(page, 0.2, 1.5, '乙：前段');
+    await addClipViaUi(page, 2.0, 2.5, '甲：后段');
+    const items = page.locator('[data-testid="clip-item"]');
+    const itemYi = items.nth(0);
+    const itemJia = items.nth(1);
+
+    // 审听前先备好一组待加入的边界与标签
+    await audio.evaluate((el: HTMLAudioElement) => {
+      el.currentTime = 0.4;
+    });
+    await page.waitForTimeout(120);
+    await page.locator('[data-testid="capture-start"]').click();
+    await audio.evaluate((el: HTMLAudioElement) => {
+      el.currentTime = 0.6;
+    });
+    await page.waitForTimeout(120);
+    await page.locator('[data-testid="capture-end"]').click();
+    await page.locator('[data-testid="label-input"]').fill('丙：审听中新增');
+
+    await itemYi.locator('[data-testid="clip-select"]').check();
+    await page.locator('[data-testid="sequential-audition"]').click();
+    const badge = page.locator('[data-testid="sequential-badge"]');
+    await expect(badge).toBeVisible();
+    await expect(badge).toContainText('播放当前片段');
+
+    // 审听乙的过程中加入新片段：记录入清单，但选择不跳走，音频继续播放乙
+    await page.locator('[data-testid="add-clip"]').click();
+    await expect(items).toHaveCount(3);
+    const itemBing = items.nth(2);
+    await expect(itemYi).toHaveClass(/selected/);
+    await expect(itemBing).not.toHaveClass(/selected/);
+    await expect(badge).toContainText('乙：前段');
+    await expect(badge).toContainText('1/2');
+    expect(await isPaused(page)).toBe(false);
+
+    // 推进到甲：选择随播放目标前移，仍不落在新增记录上
+    await expect(itemJia).toHaveClass(/selected/, { timeout: 4000 });
+    await expect(badge).toContainText('2/2');
+    await expect(itemBing).not.toHaveClass(/selected/);
+
+    // 末条结束退出：选择停在甲，新增记录始终未成为播放目标的选择
+    await expect.poll(() => isPaused(page), { timeout: 3000, intervals: [16] }).toBe(true);
+    await expect(badge).toHaveCount(0);
+    await expect(itemJia).toHaveClass(/selected/);
+    await expect(itemBing).not.toHaveClass(/selected/);
   });
 });
 

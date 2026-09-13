@@ -102,6 +102,32 @@ export default function App() {
     }
   }, []);
 
+  // 推进到下一条：选中并从其精确起点播放；媒体拒绝播放则结束本次顺序审听，
+  // 已保存记录及其顺序不变，用户仍可从当前选择重试。
+  // 切换停留定时器与切换停留期间的共享“播放”按钮都经由此处推进。
+  const advanceSequentialToNextClip = useCallback(() => {
+    clearSequentialSwitchTimer();
+    const switched = beginNextClip(sequentialRef.current);
+    if (switched.phase !== 'playing') return;
+    const target = clipsRef.current.find((c) => c.id === currentSequentialId(switched));
+    const el = audioRef.current;
+    if (!target || !el) return;
+    setSelectedId(target.id);
+    sequentialRef.current = switched;
+    setSequential(switched);
+    internalSeekRef.current = true;
+    el.currentTime = target.startMs / 1000;
+    setCurrentMs(target.startMs);
+    void el.play().catch(() => {
+      const failed = stopSequentialSession(sequentialRef.current);
+      sequentialRef.current = failed;
+      setSequential(failed);
+      setSequentialNote(
+        `顺序审听在片段「${target.label}」处被浏览器拒绝播放，已终止；记录与顺序未改变，可从该片段重新开始。`,
+      );
+    });
+  }, [clearSequentialSwitchTimer]);
+
   // 当前片段首次达到终点后的推进：暂停并复位到当前片段精确起点，再做会话
   // 推演——末条收束（空闲，停在末条起点），其余进入切换停留。
   const settleSequentialClipEnd = useCallback(() => {
@@ -121,32 +147,13 @@ export default function App() {
     sequentialRef.current = next;
     setSequential(next);
     if (next.phase !== 'switching') return;
-    // 切换下一片段：选中并从其精确起点播放；媒体拒绝播放则结束本次顺序审听，
-    // 已保存记录及其顺序不变，用户仍可从当前选择重试。
+    // 切换下一片段前稍作停留；停留期间点共享“播放”会立即推进（见 togglePlay）。
     clearSequentialSwitchTimer();
     sequentialSwitchTimerRef.current = window.setTimeout(() => {
       sequentialSwitchTimerRef.current = null;
-      const switched = beginNextClip(sequentialRef.current);
-      if (switched.phase !== 'playing') return;
-      const target = clipsRef.current.find((c) => c.id === currentSequentialId(switched));
-      const el = audioRef.current;
-      if (!target || !el) return;
-      setSelectedId(target.id);
-      sequentialRef.current = switched;
-      setSequential(switched);
-      internalSeekRef.current = true;
-      el.currentTime = target.startMs / 1000;
-      setCurrentMs(target.startMs);
-      void el.play().catch(() => {
-        const failed = stopSequentialSession(sequentialRef.current);
-        sequentialRef.current = failed;
-        setSequential(failed);
-        setSequentialNote(
-          `顺序审听在片段「${target.label}」处被浏览器拒绝播放，已终止；记录与顺序未改变，可从该片段重新开始。`,
-        );
-      });
+      advanceSequentialToNextClip();
     }, 450);
-  }, [clearSequentialSwitchTimer]);
+  }, [clearSequentialSwitchTimer, advanceSequentialToNextClip]);
 
   useEffect(() => {
     if (!audio) return;
@@ -327,6 +334,12 @@ export default function App() {
     const el = audioRef.current;
     if (!el) return;
     if (el.paused) {
+      // 顺序审听切换停留期间，游标停在刚播完片段的起点：直接播放会让刚结束的
+      // 记录再次发声。此时“播放”意为立即推进——只播放即将切换到的下一条。
+      if (sequentialRef.current.phase === 'switching') {
+        advanceSequentialToNextClip();
+        return;
+      }
       void el.play().catch(() => {
         setError('浏览器拒绝了自动播放，请再次点击播放。');
       });
@@ -340,6 +353,18 @@ export default function App() {
     const el = audioRef.current;
     if (!el || !audio) return;
     const ms = Number(event.target.value);
+    // 顺序审听播放当前片段时，拖动越过终点不得触发提前结算：游标回到当前片段
+    // 的精确起点继续播放，该片段仍依照既定边界完成审听后才推进。
+    const session = sequentialRef.current;
+    if (session.phase === 'playing') {
+      const current = clipsRef.current.find((c) => c.id === currentSequentialId(session));
+      if (current && ms >= current.endMs) {
+        internalSeekRef.current = true;
+        el.currentTime = current.startMs / 1000;
+        setCurrentMs(current.startMs);
+        return;
+      }
+    }
     internalSeekRef.current = true;
     el.currentTime = ms / 1000;
     setCurrentMs(ms);
@@ -408,7 +433,11 @@ export default function App() {
     };
     createdCountRef.current += 1;
     setClips((prev) => [...prev, clip]);
-    setSelectedId(clip.id);
+    // 顺序审听进行中：选择必须始终对应播放目标（由会话推进驱动），
+    // 新增记录不抢走选择；空闲时沿用“新增即选中新记录”的既有行为。
+    if (sequentialRef.current.phase === 'idle') {
+      setSelectedId(clip.id);
+    }
     setPendingStartMs(null);
     setPendingEndMs(null);
     setLabel('');
@@ -424,6 +453,20 @@ export default function App() {
     sequentialRef.current = idle;
     setSequential(idle);
   }, [clearSequentialSwitchTimer]);
+
+  // 媒体进入暂停时：若顺序审听仍处于“播放当前片段”，说明暂停来自会话逻辑
+  // 之外（如共享播放按钮）——会话同步退出顺序审听，游标停在用户暂停处。
+  // 会话自身的暂停（到终点结算、停止试听、导入）都先把会话状态同步更新，
+  // pause 事件异步到达时相位已不再是 playing，不会误判；自然播完只有 ended
+  // 事件，且由 onEnded 的收束逻辑负责，这里以 el.ended 兜底排除。
+  const onPause = () => {
+    setIsPlaying(false);
+    const el = audioRef.current;
+    if (!el || el.ended) return;
+    if (sequentialRef.current.phase === 'playing') {
+      endSequentialWithoutReset();
+    }
+  };
 
   // 顺序审听：从选中记录开始，按导出排序连续审听当前项与后续项。
   const startSequentialAudition = () => {
@@ -728,7 +771,7 @@ export default function App() {
           src={audio?.url}
           preload="auto"
           onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
+          onPause={onPause}
           onTimeUpdate={onTimeUpdate}
           onEnded={onEnded}
         />
